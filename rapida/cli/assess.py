@@ -169,7 +169,7 @@ def build_variable_help():
 @click.command(short_help='assess/evaluate a specific geospatial exposure components/variables', no_args_is_help=True)
 @click.option(
     '--all', '-a', is_flag=True, default=False,
-    help="compute all components and variables if this option is set"
+    help="compute all auto-runnable components and variables (excludes landuse and ntl) if this option is set"
 )
 @click.option(
     '--components', '-c', required=False, multiple=True,
@@ -230,7 +230,7 @@ def assess(ctx, all=False, components=None,  variables=None, year=None, datetime
 
     Usage:
 
-    rapida assess --all: assess all components
+    rapida assess --all: assess all auto-runnable components (excludes landuse and ntl)
 
     rapida assess -c rwi: assess RWI component only.
 
@@ -276,7 +276,7 @@ def assess(ctx, all=False, components=None,  variables=None, year=None, datetime
             target_components = components
             if len(components) == 0:
                 if all:
-                    target_components = set(filter(lambda x: x != "landuse", all_components))
+                    target_components = set(filter(lambda x: x not in {"landuse", "ntl"}, all_components))
                 else:
                     logger.warning(f"At least one component is required. If you want to assess all components, use --all option")
                     return
