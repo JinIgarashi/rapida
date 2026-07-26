@@ -36,7 +36,7 @@ async def detect_outage(
     #fetch daily data, source independent
     # --- 2. FETCH DAILY TARGET DATA ---
     daily_results = await fetch(bbox=bbox, nominal_date=nominal_date, deliverable=deliverable,
-                              progress=progress, dst_dir=dst_dir)
+                              progress=progress, dst_dir=dst_dir, mask_clouds=mask_clouds)
     if not daily_results:
         logger.info(f'No imagery was found for {nominal_date:"%Y%m%d"} over {bbox} {deliverable.split("_")[0]}')
         logger.info(f'Consider adjusting source, date or the bounding box')
