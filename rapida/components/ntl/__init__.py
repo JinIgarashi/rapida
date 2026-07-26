@@ -155,6 +155,10 @@ class NTLVariable(Variable):
         dst_dir = os.path.dirname(self.local_path)
         os.makedirs(dst_dir, exist_ok=True)
 
+        # Save the outage analysis visualization (same 6-panel plot as
+        # `ntl detect --display`) into the project's ntl folder.
+        display_path = os.path.join(dst_dir, f"{self.name}_outage.png")
+
         # NOTE: pop_vars is intentionally NOT passed to detect_outage. detect_outage's own
         # pop_vars path builds a throwaway Project from the outage polygons and re-downloads
         # population into a separate gpkg. In the assess flow we instead reuse the population
@@ -168,6 +172,7 @@ class NTLVariable(Variable):
             percentage_drop=percentage_drop,
             pop_vars=None,
             display=False,
+            display_path=display_path,
             progress=progress,
             year=year or datetime.datetime.now().year,
         )

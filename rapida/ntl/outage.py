@@ -28,7 +28,7 @@ gdal.UseExceptions()
 async def detect_outage(
         bbox: tuple[numbers.Number] = None, nominal_date: datetime = None, deliverable: str = None,
         dst_dir: str = None, mask_clouds:bool = True, percentage_drop:int = None, pop_vars:str|tuple[str]=None,
-        display: bool = False, progress: Progress = None, year=datetime.datetime.now().year):
+        display: bool = False, display_path: str = None, progress: Progress = None, year=datetime.datetime.now().year):
 
     logger.info(f'Fetching best imagery for {deliverable} {bbox}-{nominal_date} ')
     # with open(os.path.join('/tmp', 'bbox.geojson'), "w") as ff:
@@ -259,9 +259,13 @@ async def detect_outage(
                 finally:
                     # Unlink (delete) the virtual file to free up system memory
                     gdal.Unlink(vsimem_path)
-    if display:
+    if display or display_path:
         from rapida.ntl import vis
-        vis.display2(data=arrays,
-                     title=f'Outage inputs and results for {deliverable} at {bbox} on {nominal_date.date()}')
+        vis.display2(
+            data=arrays,
+            title=f'Outage inputs and results for {deliverable} at {bbox} on {nominal_date.date()}',
+            save_path=display_path,   # None for interactive-only detect
+            show=display,             # keep plt.show() only when --display asked
+        )
 
     return outage_tif_path
