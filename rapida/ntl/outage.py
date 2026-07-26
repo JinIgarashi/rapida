@@ -263,3 +263,5 @@ async def detect_outage(
         from rapida.ntl import vis
         vis.display2(data=arrays,
                      title=f'Outage inputs and results for {deliverable} at {bbox} on {nominal_date.date()}')
+
+    return outage_tif_path
