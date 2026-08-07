@@ -1,5 +1,6 @@
 from urllib.parse import urlparse
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import box
 import os
 import httpx
@@ -16,6 +17,7 @@ from shapely.wkb import loads as load_wkb
 from shapely.ops import orient, transform
 import numpy as np
 from pyproj import Transformer
+import country_converter
 
 gdal.UseExceptions()
 logger = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ async def fetch_geofabrik_index(client: httpx.AsyncClient) -> dict:
     return response.json()
 
 
-async def prepare_osm_pbf(bbox: tuple[float, float, float, float], dst_dir: str = "/tmp", progress: Progress = None,
+async def prepare_osm_pbf_old(bbox: tuple[float, float, float, float], dst_dir: str = "/tmp", progress: Progress = None,
                           max_concurrency: int = 5) -> str:
     """
     Orchestrates the entire top-down OSM extraction pipeline.
@@ -118,6 +120,159 @@ async def prepare_osm_pbf(bbox: tuple[float, float, float, float], dst_dir: str 
     return final_output_pbf
 
 
+async def prepare_osm_pbf(bbox: tuple[float, float, float, float], dst_dir: str = "/tmp", progress: Progress = None,
+                          max_concurrency: int = 5,  clip_country:str=None, use_geofabrik = False) -> str:
+    """
+    Orchestrates the entire top-down OSM extraction pipeline, supporting both Geofabrik and Movisda.
+    """
+    minx, miny, maxx, maxy = bbox
+    bbox_geom = box(minx, miny, maxx, maxy)
+    bbox_str = f"{minx},{miny},{maxx},{maxy}"
+
+    dest_path = Path(dst_dir)
+    dest_path.mkdir(parents=True, exist_ok=True)
+    final_output_pbf = str(dest_path / "local_routing.osm.pbf")
+    downloaded_files = []
+
+
+    osm_source = os.environ.get('CONNECTIVITY_OSM_SOURCE', None)
+    if osm_source is not None:
+        use_geofabrik = osm_source.lower() == 'geofabrik'
+    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        if use_geofabrik:
+            response = await client.get("https://download.geofabrik.de/index-v1.json")
+            response.raise_for_status()
+            features = [
+                f for f in response.json().get('features', [])
+                if f['properties'].get('iso3166-1:alpha2') or f['properties'].get('iso3166-2')
+            ]
+            name_col = 'name'
+        else:
+            response = await client.get("https://osm.download.movisda.io/admin/Admin-latest.geojson")
+            response.raise_for_status()
+            features = [
+                f for f in response.json().get('features', [])
+                if str(f['properties'].get('admin_level')) == "2"
+            ]
+            name_col = 'name_en'
+
+        gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+
+        intersecting = gdf[gdf.intersects(bbox_geom)]
+
+        if intersecting.empty:
+            source = "Geofabrik" if use_geofabrik else "Movisda"
+            raise ValueError(f"No valid {source} footprints cover the bbox: {bbox}")
+
+
+        intersecting['iso3'] =  country_converter.convert(intersecting[name_col].tolist(), to='ISO3')
+
+        if clip_country:
+            if not clip_country in intersecting['iso3'].tolist():
+                logger.warning(f'cli-country={clip_country} was supplied but it was not found to intersect {bbox}')
+            else:
+                intersecting = intersecting[intersecting['iso3'] == clip_country]
+
+        pbf_urls = []
+        if use_geofabrik:
+            for url in intersecting['urls'].apply(lambda x: x.get('pbf')).dropna():
+
+                try:
+                    r = await client.head(url=url, follow_redirects=True)
+                    r.raise_for_status()
+                    pbf_urls.append(url)
+                except httpx.HTTPError:
+                    # Routing to the French mirror as a safety measure
+                    fr_url = url.replace("https://download.geofabrik.de", "http://download.openstreetmap.fr/extracts")
+                    pbf_urls.append(fr_url)
+
+        else:
+            for _, row in intersecting.iterrows():
+                name = row.get('name')
+                prefix = row.get('prefix')
+                timestamp = row.get('timestamp')
+
+                actual_prefix = prefix if pd.notna(prefix) and prefix else f"{name}-"
+                pbf_urls.append(f"https://osm.download.movisda.io/admin/{actual_prefix}{timestamp}.osm.pbf")
+
+
+        tasks = []
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        for url in pbf_urls:
+            file_name = os.path.basename(urlparse(url).path)
+            filepath = dest_path / file_name
+
+            tasks.append(asyncio.Task(
+                download_tile(client, url, filepath, semaphore, progress=progress), name=file_name
+            ))
+
+        if progress and pbf_urls:
+            progress_task = progress.add_task(description=f'[red]Downloading {len(tasks)} pbf(s)...', total=len(tasks))
+
+        for task in asyncio.as_completed(tasks, timeout=1800 * len(tasks)):
+            try:
+                downloaded_file = await task
+                if progress and progress_task is not None and pbf_urls:
+                    progress.update(progress_task, description=f'[green]🡇 Downloaded {downloaded_file.name}', advance=1)
+                downloaded_files.append(str(downloaded_file))
+            except Exception as e:
+                logger.error(e)
+                raise
+            except asyncio.CancelledError:
+                for atask in tasks:
+                    if not atask.done():
+                        atask.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+    if progress and pbf_urls:
+        progress.remove_task(progress_task)
+        # ---------------------------------------------------------
+        # THE FIX: Extract FIRST, Filter Empty, Merge SECOND
+        # ---------------------------------------------------------
+        extracted_chunks = []
+
+        # 1. Extract the bounding box from each downloaded country file individually
+        for i, dl_file in enumerate(downloaded_files):
+            ext_file = os.path.join(dst_dir, f"ext_chunk_{i}.osm.pbf")
+
+            # Explicitly use complete_ways to ensure boundary routing integrity
+            run_cli([
+                "osmium", "extract", "--overwrite", "-s", "complete_ways",
+                "-b", bbox_str, dl_file, "-o", ext_file
+            ])
+
+            # Guard: Check if the extracted file actually contains data.
+            # An empty osmium PBF header is usually ~105-150 bytes.
+            if os.path.exists(ext_file) and os.path.getsize(ext_file) > 250:
+                extracted_chunks.append(ext_file)
+            else:
+                logger.info(f"Chunk for {dl_file} is empty (no OSM data in this bbox). Discarding.")
+                if os.path.exists(ext_file):
+                    os.remove(ext_file)
+
+        # 2. Merge the valid chunks
+        if len(extracted_chunks) > 1:
+            run_cli(["osmium", "merge", "--overwrite"] + extracted_chunks + ["-o", final_output_pbf])
+
+            # Clean up the intermediate chunks
+            for path in extracted_chunks:
+                os.remove(path)
+
+        elif len(extracted_chunks) == 1:
+            # If there was only one valid chunk, just rename it to the final output target
+            os.replace(extracted_chunks[0], final_output_pbf)
+
+        else:
+            raise ValueError(f"No OSM data found in the provided bbox: {bbox}")
+
+        # Optional: Clean up the massive downloaded country files to save disk space
+        # for dl_file in downloaded_files:
+        #     if os.path.exists(dl_file):
+        #         os.remove(dl_file)
+
+        return final_output_pbf
+
 
 async def extract_health_sites(pbf_path: str, dst_dir: str, progress=None) -> str:
     """
@@ -145,7 +300,7 @@ async def extract_health_sites(pbf_path: str, dst_dir: str, progress=None) -> st
 
     # Step 3: Compute centroids and flatten properties in a background thread
     def process_geometries():
-        with open(raw_geojson, "r") as f:
+        with open(raw_geojson, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         processed_features = []
@@ -174,7 +329,7 @@ async def extract_health_sites(pbf_path: str, dst_dir: str, progress=None) -> st
 
         data["features"] = processed_features
 
-        with open(final_geojson, "w") as f:
+        with open(final_geojson, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
     if progress:
@@ -197,7 +352,7 @@ def extract_origins_from_geojson(geojson_path: str) -> list[tuple[float, float]]
     """
     Extracts a list of (longitude, latitude) tuples from a GeoJSON FeatureCollection.
     """
-    with open(geojson_path, "r") as f:
+    with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     origins = []
@@ -379,12 +534,27 @@ def read_barriers(src_path: str, src_layer: str = None, barriers_buffer: float =
 
         if lyr is None:
             raise ValueError(f"Layer '{src_layer}' could not be found.")
+        source_srs = lyr.GetSpatialRef()
+        target_srs = osr.SpatialReference()
+        target_srs.ImportFromEPSG(4326)
+        # CRITICAL for GDAL 3+: Force traditional Longitude/Latitude (X/Y) axis order
+        target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
+        # 3. Check if they are different to avoid redundant transformations
+        needs_reprojection = False
+        coord_trans = None
+
+        if source_srs is not None and not source_srs.IsSame(target_srs):
+            needs_reprojection = True
+            coord_trans = osr.CoordinateTransformation(source_srs, target_srs)
         lyr.ResetReading()
         for feat in lyr:
             geom_ogr = feat.GetGeometryRef()
             if geom_ogr is None or geom_ogr.IsEmpty():
                 continue
+            # 4. Reproject the geometry in place
+            if needs_reprojection:
+                geom_ogr.Transform(coord_trans)
 
             wkb_output = geom_ogr.ExportToWkb()
             if wkb_output is None or isinstance(wkb_output, int):
@@ -411,3 +581,205 @@ def read_barriers(src_path: str, src_layer: str = None, barriers_buffer: float =
                 exclude_polygons.append(ring_coords)
 
     return exclude_polygons
+
+
+async def extract_water_bodies(pbf_path: str, dst_dir: str, progress=None) -> str:
+    """
+    Extracts inland water bodies, rivers, lakes, and ocean/coastal areas via Osmium,
+    exporting a unified water mask GeoJSON to clip or difference against isochrones.
+    """
+    dst_path = Path(dst_dir)
+    filtered_pbf = dst_path / "water_bodies.osm.pbf"
+    raw_geojson = dst_path / "raw_water_bodies.geojson"
+    final_geojson = dst_path / "water_bodies.geojson"
+
+    # Filter inland water, wide rivers, bays, reservoirs, and coastal water/land boundaries
+    tags_to_keep = [
+        "wr/natural=water,bay,strait,coastline",
+        "wr/waterway=riverbank,dock,canal",
+        "wr/landuse=reservoir,basin",
+        "wr/place=sea,ocean"
+    ]
+
+    if progress:
+        progress.console.print("[cyan]Filtering water bodies and coastlines from OSM via Osmium...[/cyan]")
+
+    # Step 1: Filter PBF down to water and coastline elements
+    run_cli(["osmium", "tags-filter", pbf_path] + tags_to_keep + ["-o", str(filtered_pbf), "--overwrite"])
+
+    # Step 2: Export to GeoJSON
+    # Osmium export automatically constructs closed polygons for natural=water relations/ways
+    run_cli(["osmium", "export", "--overwrite", str(filtered_pbf), "-o", str(raw_geojson)])
+
+    # Step 3: Process geometries and ensure clean polygon outputs in a background thread
+    def process_water_geometries():
+        with open(raw_geojson, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        processed_features = []
+
+        for i, feature in enumerate(data.get("features", []), start=1):
+            geom_dict = feature.get("geometry")
+            if not geom_dict:
+                continue
+
+            geom = shape(geom_dict)
+
+            # We only care about polygonal water geometries for clipping/masking
+            if geom.geom_type not in ["Polygon", "MultiPolygon"]:
+                continue
+
+            tags = feature["properties"].get("tags", {})
+
+            processed_features.append({
+                "type": "Feature",
+                "geometry": mapping(geom),
+                "properties": {
+                    "osm_id": feature["properties"].get("id", i),
+                    "name": tags.get("name", "unnamed_water"),
+                    "natural": tags.get("natural"),
+                    "water": tags.get("water"),
+                    "waterway": tags.get("waterway")
+                }
+            })
+
+        data["features"] = processed_features
+
+        with open(final_geojson, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    if progress:
+        progress.console.print("[cyan]Building polygon geometries for water mask...[/cyan]")
+
+    await asyncio.to_thread(process_water_geometries)
+
+    # Clean up intermediate files
+    for path in [filtered_pbf, raw_geojson]:
+        if path.exists():
+            path.unlink()
+
+    if progress:
+        progress.console.print(f"[bold green]✓ Water bodies successfully extracted to: {final_geojson}[/bold green]")
+
+    return str(final_geojson)
+
+
+import asyncio
+from pathlib import Path
+import geopandas as gpd
+
+
+async def extract_roads(pbf_path: str, dst_dir: str, progress=None) -> gpd.GeoDataFrame:
+    """
+    Extracts road network via Osmium and loads it directly into a GeoDataFrame.
+    """
+    dst_path = Path(dst_dir)
+    filtered_pbf = dst_path / "roads_only.osm.pbf"
+    roads_geojsonseq = dst_path / "roads.geojsonseq"
+
+    tags_to_keep = [
+        "w/highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential"
+    ]
+
+    if progress:
+        progress.console.print("[cyan]Filtering roads from OSM via Osmium...[/cyan]")
+
+    # Step 1: Filter PBF down to specified road types
+    await asyncio.to_thread(
+        run_cli,
+        ["osmium", "tags-filter", str(pbf_path)] + tags_to_keep + ["-o", str(filtered_pbf), "--overwrite"]
+    )
+
+    if progress:
+        progress.console.print("[cyan]Exporting roads to GeoJSONSeq...[/cyan]")
+
+    # Step 2: Export to geojsonseq (LineStrings only)
+    await asyncio.to_thread(
+        run_cli,
+        ["osmium", "export", str(filtered_pbf), "-o", str(roads_geojsonseq), "-f", "geojsonseq",
+         "--geometry-type=linestring", "--overwrite"]
+    )
+
+    # if progress:
+    #     progress.console.print("[cyan]Loading roads into GeoDataFrame...[/cyan]")
+    return roads_geojsonseq
+    # # Step 3: Load directly into GeoDataFrame
+    # def load_gdf():
+    #     # Using pyogrio to parse the geojsonseq significantly faster than Fiona
+    #     return gpd.read_file(roads_geojsonseq, engine="pyogrio")
+    #
+    # roads_gdf = await asyncio.to_thread(load_gdf)
+    #
+    # # Step 4: Clean up intermediate files
+    # for path in [filtered_pbf, roads_geojsonseq]:
+    #     if path.exists():
+    #         path.unlink()
+    #
+    # if progress:
+    #     progress.console.print("[bold green]✓ Roads successfully extracted into GeoDataFrame[/bold green]")
+    #
+    # return roads_gdf
+
+
+def filter_polygons(poly_ds_path:str=None, poly_layer:str=None, lines_ds_path:str=None, dst_dir:str=None  ):
+    dst_path = Path(dst_dir)
+    dst_filtered_poly_ds_path = dst_path / 'filtered_barriers.fgb'
+    # 1. Load and explode MultiPolygons to single parts
+    polys = gpd.read_file(poly_ds_path, layer=poly_layer, engine="pyogrio").explode(index_parts=False)
+    lines = gpd.read_file(lines_ds_path, engine="pyogrio")
+
+    if polys.crs != lines.crs:
+        polys.to_crs(lines.crs, inplace=True)
+
+    # 2. Intersect with lines and drop the join index
+    joined = polys.sjoin(lines, how="inner", predicate="intersects")
+
+    # SPEEDUP 1: Drop duplicated polygons to prevent unary_union from choking on overlaps
+    unique_polys = joined[~joined.index.duplicated(keep='first')]
+
+    # SPEEDUP 2: Isolate just the geometry column so pandas doesn't waste time aggregating attributes
+    unique_polys[['geometry']].dissolve() \
+        .to_file(dst_filtered_poly_ds_path, engine="pyogrio", promote_to_multi=True)
+
+    if dst_filtered_poly_ds_path.exists():return dst_filtered_poly_ds_path
+
+
+async def extract_admin_boundaries(pbf_path: str, dst_dir: str, admin_level: int, progress=None) -> str:
+    """
+    Extracts administrative boundaries via Osmium and exports to a GeoJSONSeq.
+    Maps standard ADM levels (0, 1, 2) to OSM admin_levels (2, 4, 6).
+    """
+    dst_path = Path(dst_dir)
+
+    # Map ADM 0, 1, 2 to proper OSM admin_levels (Country=2, Province/State=4, District/County=6)
+    osm_level = {0: 2, 1: 4, 2: 6}.get(admin_level, admin_level)
+
+    filtered_pbf = dst_path / f"admin_{osm_level}_only.osm.pbf"
+    admin_geojsonseq = dst_path / f"admin_{osm_level}.geojsonseq"
+
+    # Filter for relations and ways matching the specific admin level
+    tags_to_keep = [f"r/admin_level={osm_level}", f"w/admin_level={osm_level}"]
+
+    if progress:
+        progress.console.print(f"[cyan]Filtering admin_level={osm_level} from OSM via Osmium...[/cyan]")
+
+    # Step 1: Filter PBF down to specified administrative boundaries
+    await asyncio.to_thread(
+        run_cli,
+        ["osmium", "tags-filter", str(pbf_path)] + tags_to_keep + ["-o", str(filtered_pbf), "--overwrite"]
+    )
+
+    if progress:
+        progress.console.print("[cyan]Exporting admin boundaries to GeoJSONSeq...[/cyan]")
+
+    # Step 2: Export to geojsonseq (Requires polygon geometry type for boundaries)
+    await asyncio.to_thread(
+        run_cli,
+        ["osmium", "export", str(filtered_pbf), "-o", str(admin_geojsonseq), "-f", "geojsonseq",
+         "--geometry-type=polygon", "--overwrite"]
+    )
+
+    if progress:
+        progress.console.print("[cyan]Loading admin boundaries completed...[/cyan]")
+
+    return str(admin_geojsonseq)

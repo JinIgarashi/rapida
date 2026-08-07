@@ -1,17 +1,19 @@
 from typing import Union, Iterable
-
+from rapida.util.countries import COUNTRY_CODES
 import click
 import logging
 import tempfile
 from rapida.util.bbox_param_type import BboxParamType
 from rapida.connectivity import run_connectivity_analysis
 from rapida.cli.aclick import AsyncCommand
-from rapida.connectivity.isochrone import MODE_MAP
+from rapida.connectivity.isochrone import MODE_MAP, ISOCHRONES_MAX_RADIUS
 from rapida.cli.assess import get_variables_by_components
 logger = logging.getLogger(__name__)
 
-
-
+def validate_iso3cc(ctx, param, value):
+    if value and not value in COUNTRY_CODES:
+        raise click.BadParameter(f'Invalid ISO3 country code: {value}')
+    return value
 def validate_variables(ctx, param, value):
     """
     click callback function to validate  polulation
@@ -33,7 +35,7 @@ def parse_intervals(ctx, param, value):
     except ValueError:
         raise click.BadParameter("Time intervals must be a comma-separated list of integers (e.g., 5,15,30,60).")
 
-@click.command(short_help='run connectivity analysis', cls=AsyncCommand)
+@click.command(short_help='run connectivity analysis', cls=AsyncCommand, no_args_is_help=True)
 
 @click.option('-b', '--bbox',
               required=False,
@@ -96,7 +98,11 @@ def parse_intervals(ctx, param, value):
               type=str, callback=validate_variables,
               help=f"One or more RAPIDA population variable to compute zonal stats for withing the connectivity zones"
               )
-
+@click.option('-l','--stats-admin-level',
+                type=click.IntRange(min=1, max=2, clamp=False),
+                help='Admin level from where to extract the admin features when computing stats for --popvar/s.'\
+                      'The statistics will be computed from the results of intersecting the isochrones with admin data'
+                )
 @click.option(
     "--dst-dir",
     "-d",           # Short option
@@ -112,6 +118,36 @@ def parse_intervals(ctx, param, value):
     help="Destination directory to save the downloaded OSM pbf files."
 )
 
+@click.option(
+    '--clip-country', 'clip_country',
+    type=str,
+    callback=validate_iso3cc,
+    help="Ensure the output isochrones are located with the geometry of this country",
+    required=False
+)
+@click.option(
+    "--max-snap-distance",
+    "max_snap_distance",
+    type=click.FloatRange(min=0.0, max=ISOCHRONES_MAX_RADIUS, clamp=True),
+    default=ISOCHRONES_MAX_RADIUS,
+    show_default=True,
+    help=(
+        "Search radius in meters around the input location for candidate road edges. "
+        "Values exceeding service limits will be clamped."
+    ),
+)
+
+
+# @click.option(
+#     '--smooth',
+#     is_flag=True,
+#     help=(
+#             "By default Valhalla routing engine create isochrones using a grid and the edges of polygons are squarish."
+#             "Use this flag to smoothen them out. in some instances this can alter the isochrones significantly."
+#             "In general it is save to use smoothing on small areas (towns, cities)"
+#     ),
+#     default=True
+# )
 
 @click.option(
     '--disjoint',
@@ -123,12 +159,15 @@ def parse_intervals(ctx, param, value):
     default=False
 )
 
+
+
 @click.pass_context
 async def connectivity(ctx, bbox:tuple[float, float, float, float]=None, travel_mode:str=None,
                        time_intervals:list[int] =None, dst_dir:str=None,
                        barriers_dataset:str=None, barriers_layer:str=None, barriers_buffer:int=None,
-                       sites_dataset:str=None, sites_layer:str=None,popvar:str|tuple[str]=None,
-                       disjoint:bool=False
+                       sites_dataset:str=None, sites_layer:str=None, popvar:str|tuple[str]=None, stats_admin_level:int=None,
+                       max_snap_distance:float=None, clip_country:str=None,
+                       disjoint:bool=False, smooth:bool=True
     ):
     logger.info(f'Running connectivity analysis')
     progress = ctx.obj.get('progress')
@@ -136,6 +175,6 @@ async def connectivity(ctx, bbox:tuple[float, float, float, float]=None, travel_
         return await run_connectivity_analysis(
             bbox=bbox, dst_dir=dst_dir, travel_mode=travel_mode, time_intervals=time_intervals,
             barriers_dataset=barriers_dataset, barriers_layer=barriers_layer, barriers_buffer=barriers_buffer,
-            sites_dataset=sites_dataset, sites_layer=sites_layer, pop_vars=popvar,
-            progress=progress, disjoint=disjoint
+            sites_dataset=sites_dataset, sites_layer=sites_layer, pop_vars=popvar,stats_admin_level=stats_admin_level,
+            progress=progress, radius=max_snap_distance, clip_country=clip_country, disjoint=disjoint, smooth=smooth
         )
