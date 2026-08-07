@@ -6,10 +6,8 @@ from valhalla import get_config
 from valhalla.config import _sanitize_config, default_config
 from typing import Union
 from pathlib import Path
-import re
 import logging
 import sys
-import valhalla
 logger = logging.getLogger(__name__)
 
 DEFAULT_SPEEDS = {
@@ -192,7 +190,7 @@ async def compile_valhalla_graph(pbf_path: str, dst_dir: str, progress=None) -> 
             }
         ]
 
-        with open(speeds_config_path, "w") as f:
+        with open(speeds_config_path, "w", encoding='utf-8') as f:
             json.dump(speed_schema, f, indent=4)
 
         valhalla_conf["mjolnir"]["default_speeds_config"] = speeds_config_path
@@ -200,7 +198,23 @@ async def compile_valhalla_graph(pbf_path: str, dst_dir: str, progress=None) -> 
 
     valhalla_conf["mjolnir"]["min_reachability"] = 0
 
-    with open(config_path, "w") as f:
+    #valhalla_conf["mjolnir"]["data_processing"]["use_admin_db"] = False
+    admin_db_path = os.path.join(dst_dir, 'admin.sqlite')
+    valhalla_conf["mjolnir"]["admin"] =  str(Path(admin_db_path))
+
+    # Enable file logging for the Valhalla C++ engine
+    valhalla_conf["logging"] = {
+        "type": "file",
+        "color": False,
+        "file_name": os.path.join(dst_dir, "valhalla_build.log")
+    }
+
+    if sys.platform == "win32":
+        valhalla_conf["mjolnir"]["use_mmap"] = False
+
+
+
+    with open(config_path, "w", encoding='utf-8') as f:
         json.dump(valhalla_conf, f, indent=4)
 
 

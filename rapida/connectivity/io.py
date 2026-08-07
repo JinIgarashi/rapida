@@ -261,7 +261,7 @@ async def prepare_osm_pbf(bbox: tuple[float, float, float, float], dst_dir: str 
 
         elif len(extracted_chunks) == 1:
             # If there was only one valid chunk, just rename it to the final output target
-            os.rename(extracted_chunks[0], final_output_pbf)
+            os.replace(extracted_chunks[0], final_output_pbf)
 
         else:
             raise ValueError(f"No OSM data found in the provided bbox: {bbox}")
@@ -300,7 +300,7 @@ async def extract_health_sites(pbf_path: str, dst_dir: str, progress=None) -> st
 
     # Step 3: Compute centroids and flatten properties in a background thread
     def process_geometries():
-        with open(raw_geojson, "r") as f:
+        with open(raw_geojson, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         processed_features = []
@@ -329,7 +329,7 @@ async def extract_health_sites(pbf_path: str, dst_dir: str, progress=None) -> st
 
         data["features"] = processed_features
 
-        with open(final_geojson, "w") as f:
+        with open(final_geojson, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
     if progress:
@@ -352,7 +352,7 @@ def extract_origins_from_geojson(geojson_path: str) -> list[tuple[float, float]]
     """
     Extracts a list of (longitude, latitude) tuples from a GeoJSON FeatureCollection.
     """
-    with open(geojson_path, "r") as f:
+    with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     origins = []
@@ -613,7 +613,7 @@ async def extract_water_bodies(pbf_path: str, dst_dir: str, progress=None) -> st
 
     # Step 3: Process geometries and ensure clean polygon outputs in a background thread
     def process_water_geometries():
-        with open(raw_geojson, "r") as f:
+        with open(raw_geojson, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         processed_features = []
@@ -645,7 +645,7 @@ async def extract_water_bodies(pbf_path: str, dst_dir: str, progress=None) -> st
 
         data["features"] = processed_features
 
-        with open(final_geojson, "w") as f:
+        with open(final_geojson, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
     if progress:
